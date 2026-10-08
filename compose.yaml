@@ -1,0 +1,26 @@
+services:
+  champsim:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.champsim
+      args:
+        UBUNTU_TAG: "22.04"
+        VCPKG_REF: master
+    image: champsim-dev:ubuntu22.04
+    working_dir: /workspace
+    environment:
+      VCPKG_ROOT: /opt/vcpkg
+      VCPKG_DEFAULT_TRIPLET: x64-linux
+    volumes:
+      - .:/workspace
+      - ./traces:/traces:ro
+      - champsim-vcpkg-cache:/root/.cache/vcpkg
+      - champsim-vcpkg-downloads:/opt/vcpkg/downloads
+    stdin_open: true
+    tty: true
+    command: bash
+
+volumes:
+  champsim-vcpkg-cache:
+  champsim-vcpkg-downloads:
+

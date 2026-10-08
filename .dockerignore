@@ -1,0 +1,15 @@
+.git
+.github
+.agents
+.codex
+.aws
+.csconfig
+bin
+vcpkg
+vcpkg_installed
+ucas-oop-master
+*.o
+*.d
+*.a
+*.so
+*.log
