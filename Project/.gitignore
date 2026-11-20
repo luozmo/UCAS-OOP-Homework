@@ -38,9 +38,11 @@ vcpkg_installed/
 traces/*.champsimtrace
 traces/*.champsimtrace.*
 results/
+experiment_results/
 MIGRATION_VERIFIED.txt
 
 # Runtime logs
 *.log
 *.log.*
+
 

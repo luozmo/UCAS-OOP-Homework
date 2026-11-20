@@ -22,10 +22,13 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <string>
+#include <utility>
 
 #include "champsim.h"
 #include "channel.h"
 #include "chrono.h"
+#include "prefetch_arbiter.h"
 #include "util/bits.h"
 #include "util/to_underlying.h"
 
@@ -57,6 +60,12 @@ struct cache_builder_base {
   bool m_pref_load{};
   bool m_wq_full_addr{};
   bool m_va_pref{};
+  prefetching::prefetch_arbiter_mode m_pref_arbiter_mode{prefetching::prefetch_arbiter_mode::none};
+  std::size_t m_pref_arbiter_filter_entries{64};
+  std::size_t m_pref_arbiter_duplicate_window_cycles{256};
+  std::size_t m_pref_arbiter_budget_per_window{8};
+  std::size_t m_pref_arbiter_window_cycles{64};
+  std::string m_pref_arbiter_policy{"round_robin"};
 
   std::vector<access_type> m_pref_act_mask{access_type::LOAD, access_type::PREFETCH};
   std::vector<champsim::channel*> m_uls{};
@@ -238,6 +247,13 @@ public:
    */
   template <typename... Ps>
   cache_builder<cache_builder_module_type_holder<Ps...>, R> prefetcher();
+
+  /**
+   * Configure the multi-prefetcher arbiter. The default mode is none, which
+   * preserves the legacy behavior of sending prefetch requests directly to PQ.
+   */
+  self_type& prefetch_arbiter(prefetching::prefetch_arbiter_mode mode, std::size_t filter_entries, std::size_t duplicate_window_cycles,
+                              std::size_t budget_per_window, std::size_t window_cycles, std::string policy = "round_robin");
 
   /**
    * Specify the cache replacement policy.
@@ -519,6 +535,20 @@ template <typename... Ps>
 auto champsim::cache_builder<P, R>::prefetcher() -> champsim::cache_builder<champsim::cache_builder_module_type_holder<Ps...>, R>
 {
   return champsim::cache_builder<champsim::cache_builder_module_type_holder<Ps...>, R>{*this};
+}
+
+template <typename P, typename R>
+auto champsim::cache_builder<P, R>::prefetch_arbiter(prefetching::prefetch_arbiter_mode mode, std::size_t filter_entries,
+                                                     std::size_t duplicate_window_cycles, std::size_t budget_per_window,
+                                                     std::size_t window_cycles, std::string policy) -> self_type&
+{
+  m_pref_arbiter_mode = mode;
+  m_pref_arbiter_filter_entries = filter_entries;
+  m_pref_arbiter_duplicate_window_cycles = duplicate_window_cycles;
+  m_pref_arbiter_budget_per_window = budget_per_window;
+  m_pref_arbiter_window_cycles = window_cycles;
+  m_pref_arbiter_policy = std::move(policy);
+  return *this;
 }
 
 template <typename P, typename R>

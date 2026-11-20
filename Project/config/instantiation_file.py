@@ -163,6 +163,12 @@ def get_cache_builder(elem, ul_pairs):
         '^prefetch_activate_string': ', '.join('access_type::'+t for t in elem.get('prefetch_activate',[])),
         '^replacement_string': ', '.join(f'class {k["class"]}' for k in elem.get('_replacement_data',[])),
         '^prefetcher_string': ', '.join(f'class {k["class"]}' for k in elem.get('_prefetcher_data',[])),
+        '^pref_arbiter_mode': elem.get('_pref_arbiter_mode', 'none'),
+        '^pref_arbiter_filter_entries': elem.get('_pref_arbiter_filter_entries', 64),
+        '^pref_arbiter_duplicate_window_cycles': elem.get('_pref_arbiter_duplicate_window_cycles', 256),
+        '^pref_arbiter_budget_per_window': elem.get('_pref_arbiter_budget_per_window', 8),
+        '^pref_arbiter_window_cycles': elem.get('_pref_arbiter_window_cycles', 64),
+        '^pref_arbiter_policy': elem.get('_pref_arbiter_policy', 'round_robin'),
         '^lower_level_queues': f'channels.at({ul_pairs.index((elem.get("lower_level"), elem.get("name")))})'
     }
     if 'frequency' in elem:
@@ -175,6 +181,7 @@ def get_cache_builder(elem, ul_pairs):
     builder_parts = itertools.chain(util.multiline(itertools.chain(
         ('champsim::cache_builder{{ {^defaults} }}',),
         required_parts,
+        (('.prefetch_arbiter(champsim::prefetching::prefetch_arbiter_mode::{^pref_arbiter_mode}, {^pref_arbiter_filter_entries}, {^pref_arbiter_duplicate_window_cycles}, {^pref_arbiter_budget_per_window}, {^pref_arbiter_window_cycles}, "{^pref_arbiter_policy}")',) if '_pref_arbiter_mode' in elem else ()),
         (v for k,v in cache_builder_parts.items() if k in elem),
         (v for k,v in local_cache_builder_parts.items() if k[0] in elem and k[1] == elem[k[0]])
     ), indent=1, line_end=''))

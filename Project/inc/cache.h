@@ -22,6 +22,7 @@
 #undef CHAMPSIM_MODULE
 #endif
 
+#include <algorithm>
 #include <array>
 #include <cstddef> // for size_t
 #include <cstdint> // for uint64_t, uint32_t, uint8_t
@@ -29,9 +30,11 @@
 #include <iterator> // for size
 #include <limits>   // for numeric_limits
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include "address.h"
@@ -44,6 +47,7 @@
 #include "chrono.h"
 #include "modules.h"
 #include "operable.h"
+#include "prefetch_candidate_buffer.h"
 #include "util/to_underlying.h" // for to_underlying
 #include "waitable.h"
 
@@ -65,6 +69,7 @@ class CACHE : public champsim::operable
     uint64_t instr_id;
 
     uint32_t pf_metadata;
+    uint32_t prefetch_source_mask;
     uint32_t cpu;
 
     access_type type;
@@ -100,10 +105,20 @@ public:
 
     access_type type;
     bool prefetch_from_this;
+    uint32_t prefetch_source_mask{};
+
+    // 与 prefetch_from_this 分开保存。
+    // Demand 与预取合并后，块的 prefetch_from_this 可能变成 false，
+    // 但我们仍然要继续跟踪这次预取的时间信息。
+    bool prefetch_timing_tracked{false};
 
     uint8_t asid[2] = {std::numeric_limits<uint8_t>::max(), std::numeric_limits<uint8_t>::max()};
 
     champsim::chrono::clock::time_point time_enqueued;
+
+    // 如果 Demand 在预取仍未完成时合并进来，就记录第一次 Demand 的时间。
+    // 之后预取真正完成填充时，可能得到负的 lead time，也就是“预取来晚了”。
+    std::optional<champsim::chrono::clock::time_point> first_demand_time{};
 
     std::vector<uint64_t> instr_depend_on_me{};
     std::vector<std::deque<response_type>*> to_return{};
@@ -121,6 +136,11 @@ private:
   void finish_translation(const response_type& packet);
 
   void issue_translation(tag_lookup_type& q_entry) const;
+
+  // 记录一次预取 lead time。
+  // lead_time 为正表示预取早于 Demand；为负表示 Demand 先到，预取较晚。
+  void record_prefetch_lead_time(champsim::chrono::clock::duration lead_time, uint32_t source_mask);
+  void record_prefetch_unused(uint32_t source_mask, bool timing_tracked);
 
 public:
   using BLOCK = champsim::cache_block;
@@ -149,6 +169,11 @@ private:
   std::deque<tag_lookup_type> inflight_tag_check{};
   std::deque<tag_lookup_type> translation_stash{};
 
+  // key = set_index * NUM_WAY + way_index。
+  // 只有等待第一次 Demand 使用的预取块才会放入这个 map。
+  // 一旦 Demand 使用或被驱逐，就会删除对应项，避免无限增长。
+  std::unordered_map<std::size_t, champsim::chrono::clock::time_point> pending_prefetch_fill_times_{};
+
 public:
   std::vector<channel_type*> upper_levels;
   channel_type* lower_level;
@@ -167,6 +192,12 @@ public:
   bool match_offset_bits;
   bool virtual_prefetch;
   std::vector<access_type> pref_activate_mask;
+
+  champsim::prefetching::prefetch_arbiter_mode pref_arbiter_mode{champsim::prefetching::prefetch_arbiter_mode::none};
+  champsim::prefetching::prefetch_candidate_buffer pref_candidate_buffer;
+  champsim::prefetching::prefetch_arbiter pref_arbiter;
+  std::optional<std::size_t> active_prefetch_source{};
+  std::size_t prefetch_source_count{1};
 
   using stats_type = cache_stats;
 
@@ -212,6 +243,16 @@ public:
   long invalidate_entry(champsim::address inval_addr);
   bool prefetch_line(champsim::address pf_addr, bool fill_this_level, uint32_t prefetch_metadata);
 
+  void set_active_prefetch_source(std::size_t source_id);
+  void clear_active_prefetch_source();
+  void flush_prefetch_candidates();
+  void merge_prefetch_source_mask(champsim::address address, uint32_t source_mask);
+  bool enqueue_prefetch_request(champsim::address pf_addr, bool fill_this_level, uint32_t prefetch_metadata, uint32_t prefetch_source_mask);
+  [[nodiscard]] champsim::prefetching::prefetch_arbiter_mode get_prefetch_arbiter_mode() const;
+  [[nodiscard]] const champsim::prefetching::prefetch_arbiter_stats& get_prefetch_arbiter_stats() const;
+  [[nodiscard]] const champsim::prefetching::prefetch_candidate_buffer_stats& get_prefetch_candidate_buffer_stats() const;
+  [[nodiscard]] champsim::prefetching::prefetch_feedback get_prefetch_feedback() const;
+
   [[deprecated]] bool prefetch_line(uint64_t pf_addr, bool fill_this_level, uint32_t prefetch_metadata);
 
   [[deprecated("Use CACHE::prefetch_line(pf_addr, fill_this_level, prefetch_metadata) instead.")]] bool
@@ -253,11 +294,20 @@ public:
 
   template <typename... Ps>
   struct prefetcher_module_model final : prefetcher_module_concept {
+    CACHE* cache_{};
     std::tuple<Ps...> intern_;
-    explicit prefetcher_module_model(CACHE* cache) : intern_(Ps{cache}...) { (void)cache; /* silence -Wunused-but-set-parameter when sizeof...(Ps) == 0 */ }
+    explicit prefetcher_module_model(CACHE* cache) : cache_(cache), intern_(Ps{cache}...) {}
     void bind(CACHE* cache)
     {
+      cache_ = cache;
       std::apply([cache = cache](auto&... p) { (..., p.bind(cache)); }, intern_);
+    }
+
+    template <typename F>
+    void for_each_with_source(F&& func)
+    {
+      std::size_t source_id = 0;
+      std::apply([&](auto&... p) { (func(source_id++, p), ...); }, intern_);
     }
 
     void impl_prefetcher_initialize() final;
@@ -321,8 +371,16 @@ public:
         NUM_WAY(b.get_num_ways()), MSHR_SIZE(b.get_num_mshrs()), PQ_SIZE(b.m_pq_size), HIT_LATENCY(b.get_hit_latency() * b.m_clock_period),
         FILL_LATENCY(b.get_fill_latency() * b.m_clock_period), OFFSET_BITS(b.m_offset_bits), MAX_TAG(b.get_tag_bandwidth()), MAX_FILL(b.get_fill_bandwidth()),
         prefetch_as_load(b.m_pref_load), match_offset_bits(b.m_wq_full_addr), virtual_prefetch(b.m_va_pref), pref_activate_mask(b.m_pref_act_mask),
+        pref_arbiter_mode(b.m_pref_arbiter_mode),
+        pref_candidate_buffer(champsim::prefetching::prefetch_candidate_buffer_config{std::max<std::size_t>(sizeof...(Ps), 1), 8}),
+        pref_arbiter(champsim::prefetching::prefetch_arbiter_config{b.m_pref_arbiter_filter_entries, b.m_pref_arbiter_duplicate_window_cycles,
+                                                          b.m_pref_arbiter_budget_per_window, b.m_pref_arbiter_window_cycles,
+                                                          std::max<std::size_t>(sizeof...(Ps), 1), b.m_pref_arbiter_policy}),
         pref_module_pimpl(std::make_unique<prefetcher_module_model<Ps...>>(this)), repl_module_pimpl(std::make_unique<replacement_module_model<Rs...>>(this))
   {
+    prefetch_source_count = std::max<std::size_t>(sizeof...(Ps), 1);
+    sim_stats.prefetch_source_count = prefetch_source_count;
+    roi_stats.prefetch_source_count = prefetch_source_count;
   }
 
   CACHE(const CACHE&) = delete;
@@ -340,7 +398,11 @@ void CACHE::prefetcher_module_model<Ps...>::impl_prefetcher_initialize()
       p.prefetcher_initialize();
   };
 
-  std::apply([&](auto&... p) { (..., process_one(p)); }, intern_);
+  for_each_with_source([&](std::size_t source_id, auto& p) {
+    cache_->set_active_prefetch_source(source_id);
+    process_one(p);
+    cache_->clear_active_prefetch_source();
+  });
 }
 
 template <typename... Ps>
@@ -365,7 +427,13 @@ uint32_t CACHE::prefetcher_module_model<Ps...>::impl_prefetcher_cache_operate(ch
     return return_type{};
   };
 
-  return std::apply([&](auto&... p) { return (return_type{} ^ ... ^ process_one(p)); }, intern_);
+  return_type retval{};
+  for_each_with_source([&](std::size_t source_id, auto& p) {
+    cache_->set_active_prefetch_source(source_id);
+    retval ^= process_one(p);
+    cache_->clear_active_prefetch_source();
+  });
+  return retval;
 }
 
 template <typename... Ps>
@@ -382,7 +450,13 @@ uint32_t CACHE::prefetcher_module_model<Ps...>::impl_prefetcher_cache_fill(champ
     return return_type{};
   };
 
-  return std::apply([&](auto&... p) { return (return_type{} ^ ... ^ process_one(p)); }, intern_);
+  return_type retval{};
+  for_each_with_source([&](std::size_t source_id, auto& p) {
+    cache_->set_active_prefetch_source(source_id);
+    retval ^= process_one(p);
+    cache_->clear_active_prefetch_source();
+  });
+  return retval;
 }
 
 template <typename... Ps>
@@ -394,7 +468,11 @@ void CACHE::prefetcher_module_model<Ps...>::impl_prefetcher_cycle_operate()
       p.prefetcher_cycle_operate();
   };
 
-  std::apply([&](auto&... p) { (..., process_one(p)); }, intern_);
+  for_each_with_source([&](std::size_t source_id, auto& p) {
+    cache_->set_active_prefetch_source(source_id);
+    process_one(p);
+    cache_->clear_active_prefetch_source();
+  });
 }
 
 template <typename... Ps>
@@ -406,7 +484,11 @@ void CACHE::prefetcher_module_model<Ps...>::impl_prefetcher_final_stats()
       p.prefetcher_final_stats();
   };
 
-  std::apply([&](auto&... p) { (..., process_one(p)); }, intern_);
+  for_each_with_source([&](std::size_t source_id, auto& p) {
+    cache_->set_active_prefetch_source(source_id);
+    process_one(p);
+    cache_->clear_active_prefetch_source();
+  });
 }
 
 template <typename... Ps>
@@ -420,7 +502,11 @@ void CACHE::prefetcher_module_model<Ps...>::impl_prefetcher_branch_operate(champ
       p.prefetcher_branch_operate(ip.to<uint64_t>(), branch_type, branch_target.to<uint64_t>());
   };
 
-  std::apply([&](auto&... p) { (..., process_one(p)); }, intern_);
+  for_each_with_source([&](std::size_t source_id, auto& p) {
+    cache_->set_active_prefetch_source(source_id);
+    process_one(p);
+    cache_->clear_active_prefetch_source();
+  });
 }
 
 template <typename... Rs>

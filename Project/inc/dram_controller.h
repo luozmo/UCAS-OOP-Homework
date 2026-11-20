@@ -102,6 +102,7 @@ struct DRAM_CHANNEL final : public champsim::operable {
     uint8_t asid[2] = {std::numeric_limits<uint8_t>::max(), std::numeric_limits<uint8_t>::max()};
 
     uint32_t pf_metadata = 0;
+    uint32_t prefetch_source_mask = 0;
 
     champsim::address address{};
     champsim::address v_address{};

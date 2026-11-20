@@ -53,6 +53,7 @@ class channel
     access_type type{access_type::LOAD};
 
     uint32_t pf_metadata = 0;
+    uint32_t prefetch_source_mask = 0;
     uint32_t cpu = std::numeric_limits<uint32_t>::max();
 
     champsim::address address{};
@@ -69,13 +70,18 @@ class channel
     champsim::address v_address{};
     champsim::address data{};
     uint32_t pf_metadata = 0;
+    uint32_t prefetch_source_mask = 0;
     std::vector<uint64_t> instr_depend_on_me{};
 
-    response(champsim::address addr, champsim::address v_addr, champsim::address data_, uint32_t pf_meta, std::vector<uint64_t> deps)
-        : address(addr), v_address(v_addr), data(data_), pf_metadata(pf_meta), instr_depend_on_me(deps)
+    response(champsim::address addr, champsim::address v_addr, champsim::address data_, uint32_t pf_meta, std::vector<uint64_t> deps,
+             uint32_t source_mask = 0)
+        : address(addr), v_address(v_addr), data(data_), pf_metadata(pf_meta), prefetch_source_mask(source_mask), instr_depend_on_me(deps)
     {
     }
-    explicit response(request req) : response(req.address, req.v_address, req.data, req.pf_metadata, req.instr_depend_on_me) {}
+    explicit response(request req)
+        : response(req.address, req.v_address, req.data, req.pf_metadata, req.instr_depend_on_me, req.prefetch_source_mask)
+    {
+    }
   };
 
   template <typename R>

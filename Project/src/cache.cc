@@ -35,13 +35,14 @@
 CACHE::CACHE(CACHE&& other)
     : operable(other),
 
+      pending_prefetch_fill_times_(std::move(other.pending_prefetch_fill_times_)),
+
       upper_levels(std::move(other.upper_levels)), lower_level(std::move(other.lower_level)), lower_translate(std::move(other.lower_translate)),
 
       cpu(other.cpu), NAME(std::move(other.NAME)), NUM_SET(other.NUM_SET), NUM_WAY(other.NUM_WAY), MSHR_SIZE(other.MSHR_SIZE), PQ_SIZE(other.PQ_SIZE),
       HIT_LATENCY(other.HIT_LATENCY), FILL_LATENCY(other.FILL_LATENCY), OFFSET_BITS(other.OFFSET_BITS), block(std::move(other.block)), MAX_TAG(other.MAX_TAG),
       MAX_FILL(other.MAX_FILL), prefetch_as_load(other.prefetch_as_load), match_offset_bits(other.match_offset_bits), virtual_prefetch(other.virtual_prefetch),
       pref_activate_mask(std::move(other.pref_activate_mask)),
-
       sim_stats(std::move(other.sim_stats)), roi_stats(std::move(other.roi_stats)),
 
       pref_module_pimpl(std::move(other.pref_module_pimpl)), repl_module_pimpl(std::move(other.repl_module_pimpl))
@@ -79,6 +80,7 @@ auto CACHE::operator=(CACHE&& other) -> CACHE&
   this->match_offset_bits = other.match_offset_bits;
   this->virtual_prefetch = other.virtual_prefetch;
   this->pref_activate_mask = std::move(other.pref_activate_mask);
+  this->pending_prefetch_fill_times_ = std::move(other.pending_prefetch_fill_times_);
 
   this->sim_stats = std::move(other.sim_stats);
   this->roi_stats = std::move(other.roi_stats);
@@ -93,14 +95,16 @@ auto CACHE::operator=(CACHE&& other) -> CACHE&
 }
 
 CACHE::tag_lookup_type::tag_lookup_type(const request_type& req, bool local_pref, bool skip)
-    : address(req.address), v_address(req.v_address), data(req.data), ip(req.ip), instr_id(req.instr_id), pf_metadata(req.pf_metadata), cpu(req.cpu),
-      type(req.type), prefetch_from_this(local_pref), skip_fill(skip), is_translated(req.is_translated), instr_depend_on_me(req.instr_depend_on_me)
+    : address(req.address), v_address(req.v_address), data(req.data), ip(req.ip), instr_id(req.instr_id), pf_metadata(req.pf_metadata),
+      prefetch_source_mask(req.prefetch_source_mask), cpu(req.cpu), type(req.type), prefetch_from_this(local_pref), skip_fill(skip),
+      is_translated(req.is_translated), instr_depend_on_me(req.instr_depend_on_me)
 {
 }
 
 CACHE::fill_type::fill_type(const tag_lookup_type& req, champsim::chrono::clock::time_point _time_enqueued)
     : address(req.address), v_address(req.v_address), ip(req.ip), instr_id(req.instr_id), cpu(req.cpu), type(req.type),
-      prefetch_from_this(req.prefetch_from_this), time_enqueued(_time_enqueued), instr_depend_on_me(req.instr_depend_on_me), to_return(req.to_return)
+      prefetch_from_this(req.prefetch_from_this), prefetch_source_mask(req.prefetch_source_mask), prefetch_timing_tracked(req.prefetch_from_this), time_enqueued(_time_enqueued),
+      instr_depend_on_me(req.instr_depend_on_me), to_return(req.to_return)
 {
 }
 
@@ -117,6 +121,9 @@ CACHE::fill_type CACHE::fill_type::merge(fill_type predecessor, fill_type succes
   fill_type retval{(successor.type == access_type::PREFETCH) ? predecessor : successor};
 
   // set the time enqueued to the predecessor unless its a demand into prefetch, in which case we use the successor
+  retval.first_demand_time = predecessor.first_demand_time.has_value() ? predecessor.first_demand_time : successor.first_demand_time;
+  retval.prefetch_timing_tracked = predecessor.prefetch_timing_tracked || successor.prefetch_timing_tracked;
+  retval.prefetch_source_mask = predecessor.prefetch_source_mask | successor.prefetch_source_mask;
   retval.time_enqueued =
       ((successor.type != access_type::PREFETCH && predecessor.type == access_type::PREFETCH)) ? successor.time_enqueued : predecessor.time_enqueued;
   retval.instr_depend_on_me = merged_instr;
@@ -148,6 +155,7 @@ auto CACHE::fill_block(fill_type fill, uint32_t metadata) -> BLOCK
   to_fill.v_address = fill.v_address;
   to_fill.data = fill.data_promise->data;
   to_fill.pf_metadata = metadata;
+  to_fill.prefetch_source_mask = fill.prefetch_source_mask;
 
   return to_fill;
 }
@@ -180,6 +188,8 @@ bool CACHE::handle_fill(const fill_type& fill)
   assert(way <= set_end);
   assert(way != set_end || fill.type != access_type::WRITE); // Writes may not bypass
   const auto way_idx = std::distance(set_begin, way);        // cast protected by earlier assertion
+  const auto set_idx = get_set_index(fill.address);
+  const auto timing_key = static_cast<std::size_t>(set_idx) * NUM_WAY + static_cast<std::size_t>(way_idx);
 
   if constexpr (champsim::debug_print) {
     fmt::print("[{}] {} instr_id: {} address: {} v_address: {} set: {} way: {} type: {} prefetch_metadata: {} cycle_enqueued: {} cycle: {}\n", NAME, __func__,
@@ -222,6 +232,11 @@ bool CACHE::handle_fill(const fill_type& fill)
   if (way != set_end) {
     if (way->valid && way->prefetch) {
       ++sim_stats.pf_useless;
+      const bool timing_tracked = pending_prefetch_fill_times_.erase(timing_key) > 0;
+      if (timing_tracked) {
+        ++sim_stats.pf_timing_expired;
+      }
+      record_prefetch_unused(way->prefetch_source_mask, timing_tracked);
     }
 
     if (fill.type == access_type::PREFETCH) {
@@ -229,6 +244,26 @@ bool CACHE::handle_fill(const fill_type& fill)
     }
 
     *way = fill_block(fill, metadata_thru);
+
+    if (fill.prefetch_timing_tracked) {
+      ++sim_stats.pf_timing_fills;
+      for (std::size_t source = 0; source < champsim::prefetching::max_prefetch_sources; ++source) {
+        if ((fill.prefetch_source_mask & (uint32_t{1} << source)) != 0) {
+          ++sim_stats.pf_source_timing_fills.at(source);
+        }
+      }
+
+      if (fill.first_demand_time.has_value()) {
+        // Demand 在预取填充之前到达，lead time 通常为负数。
+        record_prefetch_lead_time(*fill.first_demand_time - current_time, fill.prefetch_source_mask);
+      } else {
+        // 等待第一次 Demand hit。
+        pending_prefetch_fill_times_[timing_key] = current_time;
+      }
+    } else {
+      // 非预取填充不应该保留旧的预取计时项。
+      pending_prefetch_fill_times_.erase(timing_key);
+    }
   }
 
   // COLLECT STATS
@@ -236,12 +271,49 @@ bool CACHE::handle_fill(const fill_type& fill)
     sim_stats.total_miss_latency_cycles += (current_time - (fill.time_enqueued + clock_period)) / clock_period;
   sim_stats.fill.increment(std::pair{fill.type, fill.cpu});
 
-  response_type response{fill.address, fill.v_address, fill.data_promise->data, metadata_thru, fill.instr_depend_on_me};
+  response_type response{fill.address, fill.v_address, fill.data_promise->data, metadata_thru, fill.instr_depend_on_me, fill.prefetch_source_mask};
   for (auto* ret : fill.to_return) {
     ret->push_back(response);
   }
 
   return true;
+}
+
+void CACHE::record_prefetch_lead_time(champsim::chrono::clock::duration lead_time, uint32_t source_mask)
+{
+  // 把模拟时间差转换为核心周期。
+  const auto lead_time_cycles = static_cast<std::int64_t>(lead_time / clock_period);
+  sim_stats.pf_lead_time_sum_cycles += lead_time_cycles;
+
+  if (lead_time_cycles < 0) {
+    ++sim_stats.pf_timing_late;
+  } else {
+    ++sim_stats.pf_timing_timely;
+  }
+
+  for (std::size_t source = 0; source < champsim::prefetching::max_prefetch_sources; ++source) {
+    if ((source_mask & (uint32_t{1} << source)) == 0) {
+      continue;
+    }
+    if (lead_time_cycles < 0) {
+      ++sim_stats.pf_source_late.at(source);
+    } else {
+      ++sim_stats.pf_source_timely.at(source);
+    }
+  }
+}
+
+void CACHE::record_prefetch_unused(uint32_t source_mask, bool timing_tracked)
+{
+  for (std::size_t source = 0; source < champsim::prefetching::max_prefetch_sources; ++source) {
+    if ((source_mask & (uint32_t{1} << source)) == 0) {
+      continue;
+    }
+    ++sim_stats.pf_source_useless.at(source);
+    if (timing_tracked) {
+      ++sim_stats.pf_source_expired.at(source);
+    }
+  }
 }
 
 bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
@@ -273,7 +345,7 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
   if (hit) {
     sim_stats.hits.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
 
-    response_type response{handle_pkt.address, handle_pkt.v_address, way->data, metadata_thru, handle_pkt.instr_depend_on_me};
+    response_type response{handle_pkt.address, handle_pkt.v_address, way->data, metadata_thru, handle_pkt.instr_depend_on_me, handle_pkt.prefetch_source_mask};
     for (auto* ret : handle_pkt.to_return) {
       ret->push_back(response);
     }
@@ -283,7 +355,23 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
     // update prefetch stats and reset prefetch bit
     if (useful_prefetch) {
       ++sim_stats.pf_useful;
+
+      for (std::size_t source = 0; source < champsim::prefetching::max_prefetch_sources; ++source) {
+        if ((way->prefetch_source_mask & (uint32_t{1} << source)) != 0) {
+          ++sim_stats.pf_source_useful.at(source);
+        }
+      }
+
+      // 预取已经填充，现在第一次被 Demand 使用。
+      // lead_time = demand_time - fill_time，通常为正数。
+      const auto timing_key = static_cast<std::size_t>(get_set_index(handle_pkt.address)) * NUM_WAY + static_cast<std::size_t>(way_idx);
+      if (const auto timing_iter = pending_prefetch_fill_times_.find(timing_key); timing_iter != std::end(pending_prefetch_fill_times_)) {
+        record_prefetch_lead_time(current_time - timing_iter->second, way->prefetch_source_mask);
+        pending_prefetch_fill_times_.erase(timing_iter);
+      }
+
       way->prefetch = false;
+      way->prefetch_source_mask = 0;
     }
   }
 
@@ -343,6 +431,11 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
       // Mark the prefetch as useful
       if (fill_entry->prefetch_from_this) {
         ++sim_stats.pf_useful;
+      }
+
+      // Demand 比预取填充更早到达，记录第一次 Demand 时间。
+      if (fill_entry->prefetch_timing_tracked && !fill_entry->first_demand_time.has_value()) {
+        fill_entry->first_demand_time = current_time;
       }
     }
 
@@ -510,6 +603,7 @@ long CACHE::operate()
   inflight_tag_check.erase(tag_check_ready_begin, finish_tag_check_end);
 
   impl_prefetcher_cycle_operate();
+  flush_prefetch_candidates();
 
   if constexpr (champsim::debug_print) {
     fmt::print("[{}] {} cycle completed: {} tags checked: {} remaining: {} stash consumed: {} remaining: {} channel consumed: {} pq consumed {} unused consume "
@@ -563,16 +657,26 @@ long CACHE::invalidate_entry(champsim::address inval_addr)
   auto inv_way = std::find_if(begin, end, matches_address(inval_addr));
 
   if (inv_way != end) {
+    // 失效一个尚未使用的预取块，也要计入 expired。
+    if (inv_way->valid && inv_way->prefetch) {
+      const auto way_idx = std::distance(begin, inv_way);
+      const auto timing_key = static_cast<std::size_t>(get_set_index(inval_addr)) * NUM_WAY + static_cast<std::size_t>(way_idx);
+      const bool timing_tracked = pending_prefetch_fill_times_.erase(timing_key) > 0;
+      record_prefetch_unused(inv_way->prefetch_source_mask, timing_tracked);
+      if (timing_tracked) {
+        ++sim_stats.pf_timing_expired;
+      }
+    }
+
     inv_way->valid = false;
   }
 
   return std::distance(begin, inv_way);
 }
 
-bool CACHE::prefetch_line(champsim::address pf_addr, bool fill_this_level, uint32_t prefetch_metadata)
+bool CACHE::enqueue_prefetch_request(champsim::address pf_addr, bool fill_this_level, uint32_t prefetch_metadata,
+                                      uint32_t prefetch_source_mask)
 {
-  ++sim_stats.pf_requested;
-
   if (std::size(internal_PQ) >= PQ_SIZE) {
     return false;
   }
@@ -580,6 +684,7 @@ bool CACHE::prefetch_line(champsim::address pf_addr, bool fill_this_level, uint3
   request_type pf_packet;
   pf_packet.type = access_type::PREFETCH;
   pf_packet.pf_metadata = prefetch_metadata;
+  pf_packet.prefetch_source_mask = prefetch_source_mask;
   pf_packet.cpu = cpu;
   pf_packet.address = pf_addr;
   pf_packet.v_address = virtual_prefetch ? pf_addr : champsim::address{};
@@ -587,8 +692,112 @@ bool CACHE::prefetch_line(champsim::address pf_addr, bool fill_this_level, uint3
 
   internal_PQ.emplace_back(pf_packet, true, !fill_this_level);
   ++sim_stats.pf_issued;
+  for (std::size_t source = 0; source < champsim::prefetching::max_prefetch_sources; ++source) {
+    if ((prefetch_source_mask & (uint32_t{1} << source)) != 0) {
+      ++sim_stats.pf_source_issued.at(source);
+    }
+  }
 
   return true;
+}
+
+bool CACHE::prefetch_line(champsim::address pf_addr, bool fill_this_level, uint32_t prefetch_metadata)
+{
+  ++sim_stats.pf_requested;
+
+  if (pref_arbiter_mode == champsim::prefetching::prefetch_arbiter_mode::round_robin && active_prefetch_source.has_value()) {
+    const auto cycle = static_cast<uint64_t>(current_time.time_since_epoch() / clock_period);
+    const auto line_tag = pf_addr.slice_upper(OFFSET_BITS).to<uint64_t>();
+    const auto source_mask = uint32_t{1} << *active_prefetch_source;
+    return pref_candidate_buffer.push(champsim::prefetching::prefetch_candidate{pf_addr.to<uint64_t>(), line_tag, static_cast<uint8_t>(*active_prefetch_source),
+                                                                     fill_this_level, prefetch_metadata, cycle, source_mask});
+  }
+
+  const auto source_mask = active_prefetch_source.has_value() ? (uint32_t{1} << *active_prefetch_source) : 0U;
+  return enqueue_prefetch_request(pf_addr, fill_this_level, prefetch_metadata, source_mask);
+}
+
+void CACHE::set_active_prefetch_source(std::size_t source_id)
+{
+  if (source_id < champsim::prefetching::max_prefetch_sources) {
+    active_prefetch_source = source_id;
+  } else {
+    active_prefetch_source.reset();
+  }
+}
+
+void CACHE::clear_active_prefetch_source() { active_prefetch_source.reset(); }
+
+void CACHE::flush_prefetch_candidates()
+{
+  if (pref_arbiter_mode != champsim::prefetching::prefetch_arbiter_mode::round_robin) {
+    return;
+  }
+
+  const auto candidates = pref_candidate_buffer.drain_round_robin();
+  const auto result = pref_arbiter.arbitrate(candidates, get_prefetch_feedback());
+  for (const auto& candidate : result.accepted) {
+    if (!enqueue_prefetch_request(champsim::address{candidate.address}, candidate.fill_this_level, candidate.metadata, candidate.source_mask)) {
+      break;
+    }
+  }
+  for (const auto& update : result.source_updates) {
+    merge_prefetch_source_mask(champsim::address{update.address}, update.source_mask);
+  }
+}
+
+void CACHE::merge_prefetch_source_mask(champsim::address address, uint32_t source_mask)
+{
+  const auto line = address.slice_upper(OFFSET_BITS);
+  const auto matches_line = [this, line](const auto& candidate) { return candidate.address.slice_upper(OFFSET_BITS) == line; };
+
+  for (auto& entry : internal_PQ) {
+    if (matches_line(entry)) {
+      entry.prefetch_source_mask |= source_mask;
+    }
+  }
+  for (auto& entry : inflight_tag_check) {
+    if (matches_line(entry)) {
+      entry.prefetch_source_mask |= source_mask;
+    }
+  }
+  for (auto& entry : MSHR) {
+    if (matches_line(entry)) {
+      entry.prefetch_source_mask |= source_mask;
+    }
+  }
+  for (auto& entry : inflight_fills) {
+    if (matches_line(entry)) {
+      entry.prefetch_source_mask |= source_mask;
+    }
+  }
+
+  auto [set_begin, set_end] = get_set_span(address);
+  for (auto iter = set_begin; iter != set_end; ++iter) {
+    if (iter->valid && iter->prefetch && matches_line(*iter)) {
+      iter->prefetch_source_mask |= source_mask;
+    }
+  }
+}
+
+champsim::prefetching::prefetch_arbiter_mode CACHE::get_prefetch_arbiter_mode() const { return pref_arbiter_mode; }
+
+const champsim::prefetching::prefetch_arbiter_stats& CACHE::get_prefetch_arbiter_stats() const { return pref_arbiter.stats(); }
+
+const champsim::prefetching::prefetch_candidate_buffer_stats& CACHE::get_prefetch_candidate_buffer_stats() const { return pref_candidate_buffer.stats(); }
+
+champsim::prefetching::prefetch_feedback CACHE::get_prefetch_feedback() const
+{
+  champsim::prefetching::prefetch_feedback feedback{};
+  for (std::size_t source = 0; source < champsim::prefetching::max_prefetch_sources; ++source) {
+    auto& entry = feedback.sources.at(source);
+    entry.issued = pref_arbiter.stats().issued.at(source);
+    entry.useful = sim_stats.pf_source_useful.at(source);
+    entry.timely = sim_stats.pf_source_timely.at(source);
+    entry.late = sim_stats.pf_source_late.at(source);
+    entry.expired = sim_stats.pf_source_expired.at(source);
+  }
+  return feedback;
 }
 
 // LCOV_EXCL_START exclude deprecated function
@@ -845,9 +1054,14 @@ void CACHE::begin_phase()
 
   new_roi_stats.name = NAME;
   new_sim_stats.name = NAME;
+  new_roi_stats.prefetch_source_count = prefetch_source_count;
+  new_sim_stats.prefetch_source_count = prefetch_source_count;
 
   roi_stats = new_roi_stats;
   sim_stats = new_sim_stats;
+
+  // 新阶段开始后，旧的待使用预取计时不再属于当前阶段。
+  pending_prefetch_fill_times_.clear();
 
   for (auto* ul : upper_levels) {
     channel_type::stats_type ul_new_roi_stats;
@@ -872,6 +1086,19 @@ void CACHE::end_phase(unsigned finished_cpu)
   roi_stats.pf_useful = sim_stats.pf_useful;
   roi_stats.pf_useless = sim_stats.pf_useless;
   roi_stats.pf_fill = sim_stats.pf_fill;
+
+  roi_stats.pf_timing_fills = sim_stats.pf_timing_fills;
+  roi_stats.pf_timing_timely = sim_stats.pf_timing_timely;
+  roi_stats.pf_timing_late = sim_stats.pf_timing_late;
+  roi_stats.pf_timing_expired = sim_stats.pf_timing_expired;
+  roi_stats.pf_lead_time_sum_cycles = sim_stats.pf_lead_time_sum_cycles;
+  roi_stats.pf_source_issued = sim_stats.pf_source_issued;
+  roi_stats.pf_source_useful = sim_stats.pf_source_useful;
+  roi_stats.pf_source_useless = sim_stats.pf_source_useless;
+  roi_stats.pf_source_timing_fills = sim_stats.pf_source_timing_fills;
+  roi_stats.pf_source_timely = sim_stats.pf_source_timely;
+  roi_stats.pf_source_late = sim_stats.pf_source_late;
+  roi_stats.pf_source_expired = sim_stats.pf_source_expired;
 
   for (auto* ul : upper_levels) {
     ul->roi_stats.RQ_ACCESS = ul->sim_stats.RQ_ACCESS;

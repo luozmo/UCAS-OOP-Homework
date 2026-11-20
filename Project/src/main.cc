@@ -22,6 +22,7 @@
 #include <CLI/CLI.hpp>
 #include <fmt/core.h>
 
+#include "builtin_metrics.h"
 #include "cache.h" // for CACHE
 #include "champsim.h"
 #ifndef CHAMPSIM_TEST_BUILD
@@ -30,8 +31,11 @@
 #include "defaults.hpp"
 #include "environment.h"
 #include "event_listeners.h"
+#include "jsonl_metric_sink.h"
+#include "metric_definition_writer.h"
 #include "ooo_cpu.h" // for O3_CPU
 #include "phase_info.h"
+#include "phase_metric_extractor.h"
 #include "stats_printer.h"
 #include "tracereader.h"
 #include "vmem.h"
@@ -63,6 +67,17 @@ int main(int argc, char** argv) // NOLINT(bugprone-exception-escape)
   long long warmup_instructions = 0;
   long long simulation_instructions = std::numeric_limits<long long>::max();
   std::string json_file_name;
+
+  // 新增：结构化指标输出文件。
+  // --metrics-jsonl 保存一条条具体指标值。
+  // --metric-definitions 保存这些指标的单位和公式说明。
+  std::string metrics_jsonl_file_name;
+  std::string metric_definitions_file_name;
+
+  // 新增：run_id 用来区分不同的仿真运行。
+  // 默认值 local 适合单独手动运行；批量实验时可由外部脚本显式指定。
+  std::string run_id{"local"};
+
   std::vector<std::string> requested_listeners;
   std::vector<std::string> trace_names;
 
@@ -84,6 +99,11 @@ int main(int argc, char** argv) // NOLINT(bugprone-exception-escape)
 
   auto* json_option =
       app.add_option("--json", json_file_name, "The name of the file to receive JSON output. If no name is specified, stdout will be used")->expected(0, 1);
+
+  // 新增命令行参数：输出结构化指标和指标定义。
+  app.add_option("--metrics-jsonl", metrics_jsonl_file_name, "Write one structured metric record per line to this JSONL file");
+  app.add_option("--metric-definitions", metric_definitions_file_name, "Write structured metric definitions to this JSON file");
+  app.add_option("--run-id", run_id, "ID used to identify this simulation run in structured metric output");
 
   app.add_option("--listeners", requested_listeners, "A list of the listeners to be attached to the run");
 
@@ -138,6 +158,45 @@ int main(int argc, char** argv) // NOLINT(bugprone-exception-escape)
 
   for (CACHE& cache : gen_environment.cache_view()) {
     cache.impl_replacement_final_stats();
+  }
+
+  // 新增：结构化指标输出。
+  // 只有用户显式传入至少一个新的输出参数时才执行，因此默认行为完全不变。
+  if (!metrics_jsonl_file_name.empty() || !metric_definitions_file_name.empty()) {
+    // 先创建内置指标定义表。
+    // PhaseMetricExtractor 会检查每个输出的 metric_id 是否已经在这里注册。
+    auto metric_definitions = champsim::metrics::make_builtin_metric_registry();
+
+    // 一条 metric_record 写成一行 JSON。
+    if (!metrics_jsonl_file_name.empty()) {
+      std::ofstream metrics_file{metrics_jsonl_file_name};
+      if (!metrics_file) {
+        fmt::print(stderr, "ERROR: cannot open metrics JSONL file: {}\n", metrics_jsonl_file_name);
+        return 1;
+      }
+
+      champsim::metrics::jsonl_metric_sink metric_sink{metrics_file};
+      champsim::metrics::phase_metric_extractor extractor{metric_definitions, metric_sink};
+
+      // phase_stats 中同时包含 sim 和 roi 两组统计，extractor.extract() 会分别输出。
+      for (const auto& stats : phase_stats) {
+        extractor.extract(stats, run_id);
+      }
+
+      metric_sink.flush();
+    }
+
+    // 写出指标定义文件。
+    // 它和 metrics.jsonl 分开保存，避免每条指标记录重复携带公式和单位说明。
+    if (!metric_definitions_file_name.empty()) {
+      std::ofstream definitions_file{metric_definitions_file_name};
+      if (!definitions_file) {
+        fmt::print(stderr, "ERROR: cannot open metric definitions file: {}\n", metric_definitions_file_name);
+        return 1;
+      }
+
+      champsim::metrics::metric_definition_writer{definitions_file}.write(metric_definitions);
+    }
   }
 
   if (json_option->count() > 0) {

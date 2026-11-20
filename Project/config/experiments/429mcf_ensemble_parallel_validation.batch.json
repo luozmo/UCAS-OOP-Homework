@@ -1,0 +1,40 @@
+{
+  "batch_id": "ensemble-parallel-validation",
+  "output_dir": "experiment_results/ensemble_parallel_validation_2026-11-19",
+  "max_workers": 4,
+  "baseline_run_id": "rr-a",
+  "defaults": {
+    "trace": "traces/429.mcf-217B.champsimtrace.xz",
+    "timeout_seconds": 900,
+    "simulation_instructions": 2000000,
+    "extra_args": [
+      "--hide-heartbeat"
+    ]
+  },
+  "runs": [
+    {
+      "run_id": "rr-a",
+      "binary": "bin/champsim_429mcf_round_robin",
+      "config_path": "config/experiments/429mcf_round_robin.json",
+      "output_dir": "experiment_results/ensemble_parallel_validation_2026-11-19/rr-a"
+    },
+    {
+      "run_id": "rr-b",
+      "binary": "bin/champsim_429mcf_round_robin",
+      "config_path": "config/experiments/429mcf_round_robin.json",
+      "output_dir": "experiment_results/ensemble_parallel_validation_2026-11-19/rr-b"
+    },
+    {
+      "run_id": "ta-a",
+      "binary": "bin/champsim_429mcf_timeliness_aware",
+      "config_path": "config/experiments/429mcf_timeliness_aware.json",
+      "output_dir": "experiment_results/ensemble_parallel_validation_2026-11-19/ta-a"
+    },
+    {
+      "run_id": "ta-b",
+      "binary": "bin/champsim_429mcf_timeliness_aware",
+      "config_path": "config/experiments/429mcf_timeliness_aware.json",
+      "output_dir": "experiment_results/ensemble_parallel_validation_2026-11-19/ta-b"
+    }
+  ]
+}

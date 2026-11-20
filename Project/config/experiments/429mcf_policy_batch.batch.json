@@ -1,0 +1,28 @@
+{
+  "batch_id": "429mcf-policy-batch",
+  "output_dir": "experiment_results/batch_cli_smoke_2026-11-19",
+  "max_workers": 2,
+  "baseline_run_id": "policy-round-robin",
+  "defaults": {
+    "trace": "traces/429.mcf-217B.champsimtrace.xz",
+    "timeout_seconds": 600,
+    "simulation_instructions": 2000000,
+    "extra_args": [
+      "--hide-heartbeat"
+    ]
+  },
+  "runs": [
+    {
+      "run_id": "policy-round-robin",
+      "binary": "bin/champsim_429mcf_round_robin",
+      "config_path": "config/experiments/429mcf_round_robin.json",
+      "output_dir": "experiment_results/batch_cli_smoke_2026-11-19/round_robin"
+    },
+    {
+      "run_id": "policy-timeliness-aware",
+      "binary": "bin/champsim_429mcf_timeliness_aware",
+      "config_path": "config/experiments/429mcf_timeliness_aware.json",
+      "output_dir": "experiment_results/batch_cli_smoke_2026-11-19/timeliness_aware"
+    }
+  ]
+}

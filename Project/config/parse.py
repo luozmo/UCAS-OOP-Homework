@@ -44,6 +44,38 @@ pmem_deprecation_warnings = {
     'columns': 'Set "bank_columns" to "columns" * 8'
 }
 
+def normalize_prefetch_arbiter(cache):
+    """Normalize the optional cache-level prefetch arbiter configuration."""
+    value = cache.get('prefetch_arbiter', {})
+    if value is None:
+        value = {}
+    if isinstance(value, str):
+        value = {'mode': value}
+    if not isinstance(value, dict):
+        raise ValueError(f"prefetch_arbiter for cache {cache.get('name', '')} must be an object or mode string")
+
+    config = {**defaults.prefetch_arbiter_defaults, **value}
+    mode = config['mode']
+    if mode not in ('none', 'round_robin'):
+        raise ValueError(f"unknown prefetch_arbiter mode: {mode}")
+    if not isinstance(config['policy'], str) or not config['policy']:
+        raise ValueError('prefetch_arbiter policy must be a non-empty string')
+
+    for key in ('filter_entries', 'duplicate_window_cycles', 'budget_per_window', 'window_cycles'):
+        if not isinstance(config[key], int) or isinstance(config[key], bool) or config[key] <= 0:
+            raise ValueError(f"prefetch_arbiter {key} must be a positive integer")
+
+    return {
+        'name': cache['name'],
+        '_pref_arbiter_mode': mode,
+        '_pref_arbiter_filter_entries': config['filter_entries'],
+        '_pref_arbiter_duplicate_window_cycles': config['duplicate_window_cycles'],
+        '_pref_arbiter_budget_per_window': config['budget_per_window'],
+        '_pref_arbiter_window_cycles': config['window_cycles'],
+        '_pref_arbiter_policy': config['policy'],
+    }
+
+
 def executable_name(*config_list):
     ''' Produce the executable name from a list of configurations '''
     name_parts = filter(None, ('champsim', *(c.get('name') for c in config_list)))
@@ -91,6 +123,22 @@ def module_parse(mod, context):
     if isinstance(mod, dict):
         return util.chain(util.subdict(mod, ('class','legacy')), context.find(mod['path']))
     return context.find(mod)
+
+def unique_module_names(modules):
+    """Remove repeated module descriptors introduced while merging repeated cache views."""
+    result = []
+    seen = set()
+    for module in util.wrap_list(modules):
+        if isinstance(module, dict):
+            key = (module.get('path'), module.get('class'))
+        else:
+            key = module
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(module)
+    return result
+
 
 def split_string_or_list(val, delim=','):
     ''' Split a comma-separated string into a list '''
@@ -383,6 +431,9 @@ class NormalizedConfiguration:
 
             caches.values(),
 
+            # Add defaults for the optional multi-prefetcher arbiter.
+            (normalize_prefetch_arbiter(cache) for cache in caches.values()),
+
             ## DEPRECATION
             # The listed keys are deprecated. For now, permit them but print a warning
             (do_deprecation(cache, cache_deprecation_keys) for cache in caches.values()),
@@ -404,7 +455,7 @@ class NormalizedConfiguration:
 
                 # Get module path names and unique module names
                '_replacement_data': list(map(replacement_parse, util.wrap_list(cache.get('replacement', 'lru')))),
-               '_prefetcher_data': [*map(functools.partial(prefetcher_parse, cache=cache), util.wrap_list(cache.get('prefetcher', 'no')))]
+               '_prefetcher_data': [*map(functools.partial(prefetcher_parse, cache=cache), unique_module_names(cache.get('prefetcher', 'no')))]
             } for k,cache in caches.items())
         )
 

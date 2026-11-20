@@ -111,7 +111,7 @@ long DRAM_CHANNEL::operate()
   if (warmup) {
     for (auto& entry : RQ) {
       if (entry.has_value()) {
-        response_type response{entry->address, entry->v_address, entry->data, entry->pf_metadata, entry->instr_depend_on_me};
+        response_type response{entry->address, entry->v_address, entry->data, entry->pf_metadata, entry->instr_depend_on_me, entry->prefetch_source_mask};
         for (auto* ret : entry.value().to_return) {
           ret->push_back(response);
         }
@@ -146,7 +146,8 @@ long DRAM_CHANNEL::finish_dbus_request()
 
   if (active_request != std::end(bank_request) && active_request->ready_time <= current_time) {
     response_type response{active_request->pkt->value().address, active_request->pkt->value().v_address, active_request->pkt->value().data,
-                           active_request->pkt->value().pf_metadata, active_request->pkt->value().instr_depend_on_me};
+                           active_request->pkt->value().pf_metadata, active_request->pkt->value().instr_depend_on_me,
+                           active_request->pkt->value().prefetch_source_mask};
     for (auto* ret : active_request->pkt->value().to_return) {
       ret->push_back(response);
     }
@@ -453,7 +454,7 @@ void DRAM_CHANNEL::check_read_collision()
       // write forward
       if (auto wq_it = std::find_if(std::begin(WQ), std::end(WQ), checker); wq_it != std::end(WQ)) {
         response_type response{rq_it->value().address, rq_it->value().v_address, wq_it->value().data, rq_it->value().pf_metadata,
-                               rq_it->value().instr_depend_on_me};
+                               rq_it->value().instr_depend_on_me, rq_it->value().prefetch_source_mask};
         for (auto* ret : rq_it->value().to_return) {
           ret->push_back(response);
         }
@@ -508,7 +509,8 @@ void MEMORY_CONTROLLER::initiate_requests()
 }
 
 DRAM_CHANNEL::request_type::request_type(const typename champsim::channel::request_type& req)
-    : pf_metadata(req.pf_metadata), address(req.address), v_address(req.address), data(req.data), instr_depend_on_me(req.instr_depend_on_me)
+    : pf_metadata(req.pf_metadata), prefetch_source_mask(req.prefetch_source_mask), address(req.address), v_address(req.address), data(req.data),
+      instr_depend_on_me(req.instr_depend_on_me)
 {
   asid[0] = req.asid[0];
   asid[1] = req.asid[1];

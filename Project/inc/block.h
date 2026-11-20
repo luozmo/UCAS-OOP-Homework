@@ -31,6 +31,7 @@ struct cache_block {
   champsim::address data{};
 
   uint32_t pf_metadata = 0;
+  uint32_t prefetch_source_mask = 0;
 };
 } // namespace champsim
 

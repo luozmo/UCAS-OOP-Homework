@@ -16,6 +16,15 @@ import itertools
 
 from . import util
 
+prefetch_arbiter_defaults = {
+    'mode': 'none',
+    'filter_entries': 64,
+    'duplicate_window_cycles': 256,
+    'budget_per_window': 8,
+    'window_cycles': 64,
+    'policy': 'round_robin',
+}
+
 def cache_core_defaults(cpu):
     ''' Generate the lower levels that a default core would expect for each of its caches '''
     yield { 'name': cpu.get('L1I'), 'lower_level': cpu.get('L2C') }
